@@ -1,0 +1,1558 @@
+#!/usr/bin/env python3
+"""
+rig-widget - a small always-on corner monitor for RAM and the AMD GPUs.
+
+Answers four questions without leaving the desktop:
+  how full is RAM, who fills it, how busy is each GPU, who is using each GPU.
+
+Design rules (measured on a 4x Radeon AI PRO R9700 AMD box, works on any
+amdgpu card whose /sys/class/drm nodes your user can read - usually member of
+group render/video):
+  * data sources are cheap sysfs + /proc only: one full scan costs ~25 ms and
+    never wakes a runtime-suspended card (no performance counters, no rocm-smi
+    subprocess per tick). rocm-smi costs ~30 MB RSS and 70 ms per call, so it is
+    not used here.
+  * GPU memory per process comes from /proc/<pid>/fdinfo (drm-memory-*,
+    amd-requested-*), which is readable by members of group render/video.
+    Values are per PASID, so the same PASID seen on several fds is taken as max,
+    not sum - summing is what makes desktop compositors look like they hold
+    "1197% VRAM".
+  * idle / suspended cards return EBUSY from sysfs; that is normal and shown as "-".
+
+Usage:
+  rig-widget                 start (or focus) the corner widget
+  rig-widget --interval 3    refresh every 3 s (default 2)
+  rig-widget --corner tl     corner: br (default), tr, bl, tl
+  rig-widget --width 320     widget width in pixels
+  rig-widget --no-holders    bars only, no "who" lines
+  rig-widget --once          print one text snapshot and exit (no window, works over SSH)
+  rig-widget --json          print one JSON snapshot and exit
+  rig-widget --stop          stop a running widget
+
+Keys in the widget: q / Esc quit, h toggles the "who" lines, click = immediate refresh.
+
+Read-only: it never touches the GPUs, never loads a model, needs no sudo.
+License: MIT
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+DRM = "/sys/class/drm"
+PROC = "/proc"
+# always the real runtime dir, even when started from an SSH shell where
+# XDG_RUNTIME_DIR is unset - otherwise --stop looks in the wrong place.
+_RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+PIDFILE = os.path.join(_RUNTIME, "rig-widget.pid")
+IGNORE_COMMS = {"rig-widget", "amdgpu_top", "pgrep", "ps"}
+args_no_models = {"on": False}  # set by main(); snapshot() is also used by --json/--once
+
+
+# ----------------------------------------------------------------- GPU cards
+# PCI device id -> short name, so the widget labels cards without calling lspci
+# (~90 ms). Unknown ids fall back to the id itself. Add to this dict for new cards.
+PCI_ID_NAMES = {
+    "1002:7551": "R9700",      # AMD Radeon AI PRO R9700 (gfx1201)
+    "1002:13C0": "iGPU",       # integrated graphics - never used for models
+    "1002:7471": "RX7900",
+    "1002:744C": "RX7900XTX",
+}
+
+
+def card_label(pci, vendor_id):
+    return PCI_ID_NAMES.get(vendor_id, vendor_id or "GPU")
+
+
+def discover_cards():
+    """Every DRM card with the amdgpu sysfs interface, sorted by PCI address.
+
+    Returns a list of dicts: card, name, pci, vendor_id, busy, vram_used,
+    vram_total (the last three are sysfs paths).
+    """
+    cards = []
+    for dev in glob.glob(f"{DRM}/card[0-9]*/device"):
+        if not os.path.exists(f"{dev}/mem_info_vram_total"):
+            continue
+        card = dev.split("/")[-2]
+        pci, vendor_id = "unknown", "?"
+        try:
+            # /sys/class/drm/cardN/device resolves to .../<bridge>/<0000:03:00.0>
+            # - the LAST path element is the card's own PCI address. The earlier
+            # ones are PCIe bridges; matching against one of those is how a naive
+            # parse ends up comparing against a device no process ever opens
+            # (fdinfo reports drm-pdev as the card address, e.g. 0000:03:00.0).
+            real = os.path.realpath(dev)
+            cand = os.path.basename(real)
+            if re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]", cand):
+                pci = cand
+            with open(f"{dev}/uevent") as fh:
+                m = re.search(r"PCI_ID=(\S+)", fh.read())
+                if m:
+                    vendor_id = m.group(1)
+        except OSError:
+            pass
+        cards.append(
+            {
+                "card": card,
+                "name": card_label(pci, vendor_id),
+                "vendor_id": vendor_id,
+                "pci": pci,
+                "busy": f"{dev}/gpu_busy_percent",
+                "vram_used": f"{dev}/mem_info_vram_used",
+                "vram_total": f"{dev}/mem_info_vram_total",
+            }
+        )
+    cards.sort(key=lambda c: c["pci"])
+    return cards
+
+
+def read_int(path):
+    """sysfs read that tolerates EBUSY (card runtime-suspended) and EACCES."""
+    try:
+        with open(path) as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------- RAM + procs
+def meminfo():
+    m = {}
+    try:
+        with open(f"{PROC}/meminfo") as fh:
+            for line in fh:
+                if ":" not in line:
+                    continue
+                k, rest = line.split(":", 1)
+                try:
+                    m[k] = int(rest.split()[0]) * 1024
+                except (ValueError, IndexError):
+                    pass
+    except OSError:
+        pass
+    return m
+
+
+def process_table():
+    """pid -> (comm, rss_bytes). VmRSS only; that is what counts against RAM."""
+    out = {}
+    for p in glob.glob(f"{PROC}/[0-9]*/status"):
+        pid = p.split("/")[2]
+        comm = None
+        rss = 0
+        try:
+            with open(p, errors="replace") as fh:
+                for line in fh:
+                    if line.startswith("Name:"):
+                        comm = line.split(":", 1)[1].strip()
+                    elif line.startswith("VmRSS:"):
+                        try:
+                            rss = int(line.split()[1]) * 1024
+                        except (ValueError, IndexError):
+                            rss = 0
+                        break
+        except OSError:
+            continue
+        if comm is not None:
+            out[pid] = (comm, rss)
+    return out
+
+
+# Per-scan caches. Reading one /proc/*/cmdline costs ~0.05 ms, but model and
+# harness discovery wants them for every process, and child_pids() wants the
+# whole parent/child map once per caller - which without caching means a full
+# /proc walk per model server and per harness. One scan per refresh instead.
+_SCAN = {"cmdline": {}, "kids": None}
+
+
+def begin_scan():
+    _SCAN["cmdline"] = {}
+    _SCAN["kids"] = None
+
+
+STATE_FILE = os.path.expanduser("~/.config/rig-widget/state.json")
+
+
+def load_state():
+    """Last session's window choices (front/back, who-lines). Missing file = defaults."""
+    try:
+        with open(STATE_FILE) as fh:
+            data = json.load(fh)
+        return {"back": bool(data.get("back", False)),
+                "show_who": bool(data.get("show_who", True))}
+    except (OSError, ValueError):
+        return {"back": False, "show_who": True}
+
+
+def save_state(state):
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w") as fh:
+            json.dump({"back": bool(state.get("back")),
+                       "show_who": bool(state.get("show_who"))}, fh)
+    except OSError:
+        pass  # a widget that cannot persist its look still watches fine
+
+
+def read_cmdline(pid):
+    """Command line as one string ('' when the process vanished or is a kernel thread)."""
+    cached = _SCAN["cmdline"].get(pid)
+    if cached is not None:
+        return cached
+    try:
+        with open(f"{PROC}/{pid}/cmdline", "rb") as fh:
+            text = fh.read().replace(b"\0", b" ").decode("utf8", "replace").strip()
+    except OSError:
+        text = ""
+    _SCAN["cmdline"][pid] = text
+    return text
+
+
+def container_of(pid):
+    """Docker container id (12 hex) a process runs in, or None. World-readable."""
+    try:
+        with open(f"{PROC}/{pid}/cgroup") as fh:
+            m = re.search(r"docker[-/]?([0-9a-f]{12,64})", fh.read())
+        return m.group(1)[:12] if m else None
+    except OSError:
+        return None
+
+
+_DOCKER_CACHE = {"t": 0.0, "id2name": {}, "ip2name": {}}
+
+
+def docker_maps(max_age=30.0):
+    """({container-id: name}, {container-ip: name}), refreshed at most every max_age.
+
+    `docker ps` + one inspect pass costs ~40 ms, so it is cached: knowing that
+    "this socket came from 172.17.0.2" is only useful as "Open WebUI".
+    """
+    now = time.time()
+    if now - _DOCKER_CACHE["t"] < max_age and _DOCKER_CACHE["id2name"]:
+        return _DOCKER_CACHE["id2name"], _DOCKER_CACHE["ip2name"]
+    id2name, ip2name = {}, {}
+    if shutil.which("docker"):
+        try:
+            out = subprocess.run(
+                ["docker", "ps", "--format", "{{.ID}}\t{{.Names}}"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+            for line in out.splitlines():
+                if "\t" in line:
+                    cid, name = line.split("\t", 1)
+                    id2name[cid[:12]] = name.lstrip("/")
+            if id2name:
+                out = subprocess.run(
+                    ["docker", "inspect", "--format",
+                     "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}\t{{.Name}}",
+                     *id2name.keys()],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout
+                for line in out.splitlines():
+                    if "\t" not in line:
+                        continue
+                    ips, name = line.split("\t", 1)
+                    for ip in ips.split():
+                        if ip:
+                            ip2name[ip] = name.lstrip("/")
+        except (OSError, subprocess.SubprocessError):
+            pass
+    _DOCKER_CACHE.update(t=now, id2name=id2name, ip2name=ip2name)
+    return id2name, ip2name
+
+
+def gpu_holders():
+    """{(pci, pid): (comm, vram, gtt, resident_vram)} from amdgpu fdinfo.
+
+    Two fields per PASID, and the difference matters:
+      amd-requested-vram/gtt  what the process asked the driver to place there -
+                              the useful "who is using this card" number.
+      drm-memory-vram (resident) every mapping the process holds, INCLUDING
+                              buffers shared with other processes. A compositor
+                              with 4 GL contexts reports the whole shared arena
+                              once per context, so any cross-fd sum prints
+                              "380 GB" on a 32 GB card (amdgpu_top shows the
+                              same as "1197%").
+
+    So the display uses requested; resident is kept in JSON for debugging.
+    Values are per PASID -> repeated fds take max(), never sum.
+    GTT = GPU pages living in system RAM, the number that explains a full 60 GB.
+    """
+    best = {}
+    for f in glob.glob(f"{PROC}/[0-9]*/fdinfo/*"):
+        try:
+            with open(f, errors="replace") as fh:
+                txt = fh.read()
+        except OSError:
+            continue
+        if "drm-driver:\tamdgpu" not in txt:
+            continue
+        pid = f.split("/")[2]
+        d = {}
+        for line in txt.split("\n"):
+            if ":\t" in line:
+                k, v = line.split(":\t", 1)
+                d[k.strip()] = v.strip()
+        pci = d.get("drm-pdev", "?")
+        req_vram = kib(d.get("amd-requested-vram"))
+        res_vram = kib(d.get("drm-memory-vram"))
+        gtt = max(kib(d.get("amd-requested-gtt")), kib(d.get("drm-resident-gtt")))
+        shown = req_vram or res_vram
+        if shown + gtt < 32 * 1024 * 1024:  # ignore sub-32MiB noise
+            continue
+        try:
+            comm = open(f"{PROC}/{pid}/comm").read().strip()
+        except OSError:
+            comm = "?"
+        key = (pci, pid)
+        prev = best.get(key, (comm, 0, 0, 0))
+        best[key] = (comm, max(prev[1], shown), max(prev[2], gtt), max(prev[3], res_vram))
+    return best
+
+
+def kib(text):
+    """'32391584 KiB' -> bytes."""
+    if not text:
+        return 0
+    parts = text.split()
+    try:
+        n = int(float(parts[0]))
+    except (ValueError, IndexError):
+        return 0
+    unit = parts[1].lower() if len(parts) > 1 else "kib"
+    return n * {"b": 1, "kib": 1024, "mib": 1024**2, "gib": 1024**3}.get(unit, 1024)
+
+
+# ------------------------------------------------- model servers and clients
+# Engine argv[0] basenames that mean "this process serves a model".
+ENGINE_ARGV0 = {
+    "radiance": "radiance",
+    "llama-server": "llama.cpp",
+    "api-server": "llama.cpp",
+    "llama-swap": "llama-swap",
+    "vllm": "vLLM",
+    "api.sh": "llama.cpp",
+    "ollama": "ollama",
+    "text-generation-launcher": "TGI",
+}
+
+# Friendly names for the things that drive the models on this rig, matched
+# against cmdline then comm. Order matters: first match wins.
+HARNESS_LABELS = [
+    ("openclaw", "OpenClaw (Pedro)"),
+    (".npm-global/lib/node_modules/openclaw", "OpenClaw (Pedro)"),
+    ("open_webui", "Open WebUI"),
+    ("open-webui", "Open WebUI"),
+    ("rig_tools.py", "rig-tools MCP"),
+    ("cryptoagent", "crypto agent"),
+    ("deal-hunter", "Deal Hunter"),
+    ("comfy", "ComfyUI"),
+    ("speaches", "Speaches (voice)"),
+    ("llama-swap", "llama-swap"),
+    ("netdata", "netdata"),
+    ("warp-terminal", "terminal (Warp)"),
+    ("kitty", "terminal"),
+    ("gnome-terminal", "terminal"),
+    ("code", "VS Code"),
+    ("chrome", "browser"),
+    ("firefox", "browser"),
+    ("Xwayland", "desktop"),
+    ("gnome-shell", "desktop"),
+    ("mutter", "desktop"),
+    ("python3 -m uvicorn", "uvicorn app"),
+]
+
+LLAMA_SWAP_URL = os.environ.get("LLAMA_SWAP_URL", "http://127.0.0.1:8080")
+_SWAP_CACHE = {"t": 0.0, "data": {}}
+
+
+def llama_swap_state(max_age=1.5):
+    """{port: {alias, state, title}} from llama-swap, plus whether it is up.
+
+    llama-swap knows the *friendly* model name (the config.yaml alias) that the
+    engine's own command line does not; the engine only knows its weights file.
+    Answering from cache keeps the refresh interval honest.
+    """
+    now = time.time()
+    if now - _SWAP_CACHE["t"] < max_age:
+        return _SWAP_CACHE["data"]
+    out = {}
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(f"{LLAMA_SWAP_URL}/running", timeout=0.8) as fh:
+            data = json.load(fh)
+        for r in data.get("running", []):
+            cmd = " ".join((r.get("cmd") or "").split())
+            # Key the entry by the port its engine listens on. Compose-based
+            # entries carry "PORT=5807"; plain llama.cpp entries carry
+            # "--port 5810" (the ${PORT} macro already substituted), and the
+            # proxy URL is the last resort. A missed key printed "?" for a
+            # model whose real name llama-swap had been telling us all along.
+            port = None
+            for pat in (r"\bPORT=(\d+)", r"--(?:port|api-port)[= ]+(\d+)",
+                        r"://[\w.]+:(\d+)"):
+                m = re.search(pat, cmd) or re.search(pat, r.get("proxy") or "")
+                if m:
+                    port = int(m.group(1))
+                    break
+            if port:
+                out[port] = {
+                    "alias": r.get("model") or "?",
+                    "state": r.get("state") or "?",
+                    "title": r.get("name") or "",
+                    "cmd": cmd,
+                }
+    except Exception:
+        pass  # llama-swap down or slow: fall back to process scanning alone
+    _SWAP_CACHE.update(t=now, data=out)
+    return out
+
+
+def child_pids(parents):
+    """All descendants of the given pids; the parent/child map is built once per scan."""
+    if _SCAN["kids"] is not None:
+        kids = _SCAN["kids"]
+    else:
+        kids = _build_kids()
+        _SCAN["kids"] = kids
+    seen, queue = set(int(p) for p in parents), list(int(p) for p in parents)
+    while queue:
+        for kid in kids.get(queue.pop(), []):
+            if kid not in seen:
+                seen.add(kid)
+                queue.append(kid)
+    return seen
+
+
+def _build_kids():
+    kids = {}
+    for stat in glob.glob(f"{PROC}/[0-9]*/stat"):
+        try:
+            with open(stat) as fh:
+                txt = fh.read()
+            pid = int(txt[: txt.rindex(")")].split()[-1]) if ")" in txt else int(txt.split()[0])
+            ppid = int(txt[txt.rindex(")") + 2 :].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        kids.setdefault(ppid, []).append(pid)
+    return kids
+
+
+def pci_to_index(cards):
+    """PCI -> widget GPU index (both are PCI-sorted, so this equals amd-smi/HIP order)."""
+    return {c["pci"]: (f"iGPU" if c["name"] == "iGPU" else f"GPU{i}")
+            for i, c in enumerate(cards)}
+
+
+def model_servers(procs, holders, pci_names=None):
+    """What model is loaded, in which engine, on which cards, held by which pids.
+
+    The kernel knows only PIDs, so the model name has to come from somewhere
+    else: the engine's own command line (--model ..., `vllm serve ...`) and, for
+    the friendly alias, llama-swap's /running. Nothing here needs root.
+    """
+    id2name, _ = docker_maps()
+    swap = llama_swap_state()
+    servers = []
+    for pid in list(procs):
+        cmd = read_cmdline(pid)
+        if not cmd:
+            continue
+        argv0 = os.path.basename(cmd.split(" ", 1)[0])
+        engine = ENGINE_ARGV0.get(argv0)
+        if engine is None:
+            if re.search(r"\bpython[0-9.]*\s+\S*vllm\s+serve\b|\bvllm\s+serve\b", cmd):
+                engine = "vLLM"
+            elif "llama-server" in cmd:
+                engine = "llama.cpp"
+            else:
+                continue
+        # llama-swap itself is the proxy, not a model: it is the router row.
+        is_proxy = argv0 == "llama-swap" or "--watch-config" in cmd
+        model, friendly = None, None
+        # llama.cpp: "llama-server --port ... -m /path/model.gguf" (llama-swap
+        # cmds carry NEWLINES between args, so every separator is [\s=]+). Its
+        # --alias is the friendly name. vLLM: "vllm serve /path --served-model-name=x".
+        # radiance: --model file.rad. Tolerant patterns beat a strict flag list:
+        # flag names drift between engine versions, "flag then path" does not.
+        def flag(*names):
+            alt = "|".join(re.escape(n) for n in names)
+            return re.compile(r"(?:^|\s)-(?:%s)[=\s]+(\S+)" % alt)
+
+        m = flag("model", "model-path", "gguf", "checkpoint").search(cmd)
+        if not m:
+            m = re.search(r"(?:^|\s)-m[=\s]+(\S+)", cmd)  # llama.cpp short form
+        if m:
+            model = m.group(1)
+        m = flag("alias", "served-model-name").search(cmd)
+        if m:
+            friendly = m.group(1)
+        if not model:
+            m = re.search(r"(?:^|\s)vllm\s+serve\s+(\S+)", cmd)
+            if m:
+                model = m.group(1)
+        if model:
+            friendly = friendly or None
+        port = None
+        m = re.search(r"--(?:port|api-port|grpc-port)[= ]+(\d+)", cmd)
+        if m:
+            port = int(m.group(1))
+        if is_proxy:
+            port = port or 8080
+        if not model and not is_proxy:
+            model = "?"
+        if is_proxy:
+            model = None
+        # The engine process is usually not the one holding the GPU fds: with
+        # docker/ROCm the driver sees the container's process, and llama-swap
+        # never touches the card at all. So walk the whole process family and
+        # keep whichever members actually appear in fdinfo.
+        pid_i = int(pid)
+        family = child_pids([pid_i]) | {pid_i}
+        fd_pids = {int(q) for (_pci, q) in holders if str(q).isdigit()}
+        pids = sorted(family & fd_pids) or [pid_i]
+        gpus = {}
+        for (pci, q), (_c, vram, gtt, _r) in holders.items():
+            if str(q).isdigit() and int(q) in pids:
+                g = gpus.setdefault(pci, [0, 0])
+                g[0] = max(g[0], vram)
+                g[1] = max(g[1], gtt)
+        info = swap.get(port, {}) if port else {}
+        if not info and port:
+            # llama-swap did not key by this port (proxy missing, PORT= elsewhere
+            # in the cmd): scan its entries instead of showing "?" for a model we
+            # can actually name.
+            for _p, ent in swap.items():
+                c = ent.get("cmd") or ""
+                if re.search(rf"PORT={port}(?:\D|$)", c) or re.search(rf"(?:--port|:){port}(?:\D|$)", c):
+                    info = ent
+                    break
+        servers.append(
+            {
+                "engine": engine,
+                "pid": int(pid),
+                "pids": pids,
+                "port": port,
+                "proxy": is_proxy,
+                "model_raw": model,
+                "friendly": friendly,
+                "alias": info.get("alias"),
+                "state": info.get("state"),
+                "title": info.get("title"),
+                "container": id2name.get(container_of(pid) or "", None),
+                "gpus": {(pci_names or {}).get(p, p): v for p, v in gpus.items()},
+            }
+        )
+    # A model that is loaded but whose process we cannot see (other user, or
+    # llama-swap reporting it) still deserves a row.
+    for port, info in swap.items():
+        if not any(sv.get("port") == port and not sv["proxy"] for sv in servers):
+            servers.append(
+                {
+                    "engine": "?",
+                    "pid": None,
+                    "pids": [],
+                    "port": port,
+                    "proxy": False,
+                    "model_raw": None,
+                    "friendly": None,
+                    "alias": info.get("alias"),
+                    "state": info.get("state"),
+                    "title": info.get("title"),
+                    "container": None,
+                    "gpus": {},
+                }
+            )
+    servers.sort(key=lambda sv: (sv["proxy"], sv["alias"] or sv["model_raw"] or ""))
+    return servers
+
+
+def established():
+    """[(local_ip, local_port, peer_ip, peer_port, peer_comm, peer_pid)] from `ss`.
+
+    One ss call costs ~20 ms, affordable every refresh. The columns are picked by
+    shape, not by index, because `ss ... state established` omits the State column
+    that plain `ss` prints - trusting fixed indexes silently swaps local and peer,
+    which turns every client into "some remote host".
+    """
+    if not shutil.which("ss"):
+        return []
+    try:
+        out = subprocess.run(
+            ["ss", "-tnp", "state", "established"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    def split_addr(a):
+        """'[::ffff:172.17.0.2]:51748' / '127.0.0.1:8080' -> (ip, port).
+
+        ss wraps IPv6 (and IPv4-mapped IPv6, which is how Docker traffic shows
+        up) in brackets, so the port has to come off the end BEFORE the brackets
+        are stripped - stripping first leaves a ']' on the address and then no
+        address ever matches the docker IP map.
+        """
+        if "]" in a:
+            head, sep, tail = a.rpartition("]")
+            ip = head.lstrip("[")
+            port = tail.lstrip(":")
+        else:
+            head, sep, tail = a.rpartition(":")
+            ip, port = head, tail
+        if not port.isdigit():
+            return a, None
+        if ip.startswith("::ffff:"):  # IPv4-mapped IPv6 -> plain IPv4, so the
+            ip = ip[7:]                # docker map (172.17.0.2) matches it
+        if ip == "::1":
+            ip = "127.0.0.1"
+        return ip, int(port)
+
+    def is_addr(tok):
+        _ip, port = split_addr(tok)
+        return port is not None and (":" in tok or "." in tok)
+
+    rows = []
+    for line in out.splitlines()[1:]:
+        cols = line.split()
+        addrs = [c for c in cols if is_addr(c)]
+        if len(addrs) < 2:
+            continue
+        lip, lport = split_addr(addrs[0])
+        pip, pport = split_addr(addrs[1])
+        comm, pid = None, None
+        m = re.search(r'users:\(\("(.+?)",pid=(\d+)', line)
+        if m:
+            comm, pid = m.group(1), int(m.group(2))
+        rows.append((lip, lport, pip, pport, comm, pid))
+    return rows
+
+
+def harness_label(pid, comm, ip, ip2name, id2name):
+    """Human name of whatever is driving a model: a harness, an app, a person."""
+    if ip and ip in ip2name:
+        name = ip2name[ip]
+        return {"open-webui": "Open WebUI", "openwebui-https": "Open WebUI (https)"}.get(name, name)
+    if pid:
+        cmd = read_cmdline(pid)
+        for needle, label in HARNESS_LABELS:
+            if needle in (cmd or "") or needle == (comm or ""):
+                return label
+        cid = container_of(pid)
+        if cid and cid in id2name:
+            return id2name[cid]
+    if comm:
+        for needle, label in HARNESS_LABELS:
+            if needle == comm:
+                return label
+        return comm
+    return ip or "remote"
+
+
+def harness_processes(procs, model_ports, rows=None, maps=None):
+    """Harnesses/agents running on this box, and whether each is connected now.
+
+    An agent between two requests holds no socket, so "who uses the models" is
+    incomplete without also listing the harnesses that exist but are idle.
+    model_ports is used only to say which of them has a live connection right now.
+    """
+    agents = ("openclaw", ".npm-global/lib/node_modules/openclaw", "open_webui",
+              "open-webui", "rig_tools.py", "cryptoagent", "deal-hunter", "comfy",
+              "speaches")
+    id2name, ip2name = maps if maps else docker_maps()
+    connected_pids, connected_ips = set(), set()
+    for _lip, lport, pip, _pport, _comm, pid in (rows if rows is not None else established()):
+        if lport in model_ports:
+            if pid:
+                connected_pids.add(pid)
+            if pip:
+                connected_ips.add(pip)
+    name2ip = {v: k for k, v in ip2name.items()}
+    out, seen = [], set()
+    for pid in procs:
+        cmd = read_cmdline(pid)
+        if not cmd:
+            continue
+        label = None
+        for needle in agents:
+            if needle in cmd:
+                label = dict(HARNESS_LABELS).get(needle)
+                break
+        if not label:
+            continue
+        if label in seen:
+            continue
+        seen.add(label)
+        family = child_pids([int(pid)]) | {int(pid)}
+        cname = id2name.get(container_of(pid) or "", None)
+        live = bool(family & connected_pids) or (cname in name2ip and name2ip[cname] in connected_ips)
+        out.append({
+            "label": label,
+            "pid": int(pid),
+            "live": live,
+            "container": cname,
+        })
+    out.sort(key=lambda h: (not h["live"], h["label"]))
+    return out
+
+
+def clients_of(rows, port, skip_pids=()):
+    """{label: connections} for every client currently connected to `port`.
+
+    Reading this needs both directions of ss output, and the reason is subtle:
+
+      * a host process client produces TWO rows (its own client-side row, which
+        names it, plus the server's row). The client-side row is the informative
+        one: on the server row the process column names the listener instead.
+      * a container client produces only the SERVER row, because the container's
+        half of the connection lives in another network namespace that plain
+        `ss` cannot see. Those clients are named from their source IP through the
+        docker address map - which is how "Open WebUI" is credited here, since it
+        runs in a container.
+
+    So: name what the client-side rows reveal, then name whatever the server-side
+    rows show that no client-side row claimed.
+    """
+    id2name, ip2name = docker_maps()
+    named = {
+        "open-webui": "Open WebUI",
+        "openwebui-https": "Open WebUI (https)",
+        "speaches": "Speaches (voice)",
+    }
+    out = {}
+    claimed = set()
+    for _lip, _lport, pip, pport, comm, pid in rows:
+        if pport != port:
+            continue
+        claimed.add((_lip, _lport))
+        if pid and pid in skip_pids:
+            continue
+        label = harness_label(pid, comm, pip, ip2name, id2name)
+        out[label] = out.get(label, 0) + 1
+    for lip, lport, pip, pport, _comm, _pid in rows:
+        if lport != port or (pip, pport) in claimed:
+            continue
+        if pip in ip2name:
+            label = named.get(ip2name[pip], ip2name[pip])
+        elif pip.startswith(("127.", "::1")):
+            label = "localhost"      # host process whose client row we could not read
+        else:
+            label = f"remote {pip}"
+        out[label] = out.get(label, 0) + 1
+    return out
+
+
+SELF_PIDS = {os.getpid()}
+
+
+def model_users(servers, rows=None):
+    """Attach to each model: whether it is mid-request and who drives it.
+
+    Two hops are joined: client -> router and router -> engine. A model counts as
+    in use only while the router itself holds a socket to that engine's port;
+    otherwise a browser merely reading the router UI would look like it was using
+    the model. The router is then replaced by what is behind it, because a proxy
+    is a pipe and not a user.
+    """
+    for sv in servers:
+        sv["users"] = []
+        sv["in_flight"] = False
+    if rows is None:
+        rows = established()
+    proxies = [sv for sv in servers if sv["proxy"]]
+    proxy_pids = {px["pid"] for px in proxies if px.get("pid")}
+
+    for px in proxies:
+        if px.get("port"):
+            px["users"] = [
+                {"label": lab, "conns": n, "via_proxy": None}
+                for lab, n in sorted(clients_of(rows, px["port"], proxy_pids | SELF_PIDS).items(),
+                                     key=lambda x: -x[1])
+            ]
+
+    # Which engine ports does the router itself hold live sockets to? Only those
+    # models can count as "mid request" - a browser idling on the router UI keeps
+    # a socket to the router but the router keeps none to the engine.
+    router_targets = {pport for _lip, _lport, _pip, pport, _comm, pid in rows
+                      if pport and pid in proxy_pids}
+    for sv in servers:
+        if sv["proxy"] or not sv.get("port"):
+            continue
+        skip = ({sv["pid"]} if sv.get("pid") else set()) | SELF_PIDS
+        direct = clients_of(rows, sv["port"], skip)
+        sv["users"] = [{"label": lab, "conns": n, "via_proxy": None}
+                       for lab, n in sorted(direct.items(), key=lambda x: -x[1])]
+        if sv["port"] in router_targets:
+            sv["in_flight"] = True
+            behind = {}
+            for px in proxies:
+                if not px.get("port"):
+                    continue
+                for u in px["users"]:
+                    behind[u["label"]] = behind.get(u["label"], 0) + u["conns"]
+            if behind:
+                sv["users"] = [{"label": lab, "conns": n, "via_proxy": "llama-swap"}
+                               for lab, n in sorted(behind.items(), key=lambda x: -x[1])]
+    return servers
+
+
+def snapshot():
+    """One cheap read of everything the widget shows."""
+    begin_scan()
+    mem = meminfo()
+    total = mem.get("MemTotal", 0)
+    avail = mem.get("MemAvailable", 0)
+    procs = process_table()
+    top_ram = sorted(
+        ((c, r, p) for p, (c, r) in procs.items() if c not in IGNORE_COMMS),
+        key=lambda x: -x[1],
+    )[:4]
+
+    holders = gpu_holders()
+    by_pci = {}
+    for (pci, pid), (comm, vram, gtt, resident) in holders.items():
+        by_pci.setdefault(pci, []).append(
+            {"comm": comm, "pid": int(pid), "vram": vram, "gtt": gtt, "resident_vram": resident}
+        )
+
+    card_list = discover_cards()
+    gpus = []
+    for card in card_list:
+        used = read_int(card["vram_used"])
+        tot = read_int(card["vram_total"]) or 1
+        busy = read_int(card["busy"])
+        people = sorted(by_pci.get(card["pci"], []), key=lambda h: -(h["vram"] + h["gtt"]))[:3]
+        gpus.append(
+            {
+                "card": card["card"],
+                "name": card["name"],
+                "pci": card["pci"],
+                "busy": busy,          # None == suspended / unreadable
+                "vram_used": used,     # None == suspended / unreadable
+                "vram_total": tot,
+                "holders": people,
+            }
+        )
+
+    if args_no_models.get("on"):
+        servers, harnesses = None, []   # None == "not measured", not "nothing loaded"
+    else:
+        rows = established()  # one ss call feeds both the users join and liveness
+        servers = model_users(model_servers(procs, holders, pci_to_index(card_list)), rows)
+        ports = {sv["port"] for sv in servers if sv.get("port")}
+        harnesses = harness_processes(procs, ports, rows, docker_maps())
+        harnesses = [h for h in harnesses if h["label"] != "llama-swap"]
+
+    return {
+        "t": time.strftime("%H:%M:%S"),
+        "host": socket.gethostname(),
+        "servers": servers,
+        "harnesses": harnesses,
+        "ram_total": total,
+        "ram_avail": avail,
+        "ram_used": total - avail,
+        "swap_total": mem.get("SwapTotal", 0),
+        "swap_free": mem.get("SwapFree", 0),
+        "top_ram": [{"comm": c, "rss": r, "pid": p} for c, r, p in top_ram],
+        "gpus": gpus,
+    }
+
+
+# ----------------------------------------------------------------- text mode
+def gb(n):
+    if n is None:
+        return "-"
+    return f"{n / 1024**3:.1f}G"
+
+
+def bar(frac, width=24):
+    if frac is None:
+        return "[" + "?" * width + "]"
+    n = int(round(frac * width))
+    return "[" + "#" * n + "." * max(0, width - n) + "]"
+
+
+def model_label(sv):
+    """Best human name: llama-swap alias > engine --alias > weights filename."""
+    for key in ("alias", "friendly"):
+        if sv.get(key):
+            return sv[key]
+    raw = sv.get("model_raw") or "?"
+    base = os.path.basename(raw)
+    for ext in (".rad", ".gguf", ".safetensors"):
+        base = base.replace(ext, "")
+    return base
+
+
+def server_line(sv):
+    """One compact line: model  engine  cards+VRAM  [state]"""
+    if sv.get("proxy"):
+        # The router holds no model of its own; every client goes through it
+        # before reaching the model rows, so say what it does, not "?".
+        return f"llama-swap router :{sv.get('port')} - all clients pass through here"
+    parts = [model_label(sv)]
+    cards = [f"{name} {gb(v)}".rstrip() for name, (v, _g) in sv["gpus"].items()]
+    how = sv["engine"] + (f" on {' + '.join(cards)}" if cards else "")
+    if sv.get("state") and sv["state"] != "ready":
+        how += f" ({sv['state']})"
+    parts.append(how)
+    return "\n    ".join(parts)
+
+
+def users_line(sv):
+    """Who is talking to this model right now, through whatever router."""
+    users = sv.get("users") or []
+    names = ", ".join(
+        u["label"] + (f" x{u['conns']}" if u["conns"] > 1 else "")
+        + (" (via llama-swap)" if isinstance(u.get("via_proxy"), str) else "")
+        for u in users
+    )
+    if sv["proxy"]:
+        return "clients: " + names if users else "clients: none connected"
+    if not users:
+        return "used by: nobody right now"
+    if sv.get("in_flight"):
+        return "ANSWERING NOW: " + names
+    return "connected: " + names + " (no request running)"
+
+
+def render_text(s):
+    L = []
+    ramf = (s["ram_used"] / s["ram_total"]) if s["ram_total"] else None
+    used_used = s["ram_total"] - s["ram_avail"]
+    L.append(f"{s['host']}  {s['t']}")
+    L.append(
+        f"RAM  {bar(ramf)}  {gb(used_used)}/{gb(s['ram_total'])}  "
+        f"avail {gb(s['ram_avail'])}  swap {gb(s['swap_total'] - s['swap_free'])}/{gb(s['swap_total'])}"
+    )
+    L.append("     " + "  ".join(f"{p['comm']} {gb(p['rss'])}" for p in s["top_ram"]))
+    if s.get("servers") is not None:
+        sv_list = s["servers"]
+        models = [x for x in sv_list if not x["proxy"]]
+        L.append(("LOADED MODELS" if models else "NO MODEL LOADED") if sv_list else "NO MODEL LOADED")
+        for sv in sv_list:
+            L.append("  " + server_line(sv))
+            L.append("     -> " + users_line(sv))
+        if s.get("harnesses"):
+            L.append("     tools: " + "  ".join(
+                (h["label"] + " (using now)" if h["live"] else h["label"])
+                for h in s["harnesses"]))
+    # PCI order == amd-smi / HIP index order on this rig, so GPU0 here is GPU0
+    # in gpu-status, rocm-smi and torch. The iGPU keeps its own name.
+    for i, g in enumerate(s["gpus"]):
+        bf = (g["busy"] / 100.0) if g["busy"] is not None else None
+        vf = (g["vram_used"] / g["vram_total"]) if g["vram_used"] is not None else None
+        label = g["name"] if g["name"] == "iGPU" else f"GPU{i}"
+        L.append(
+            f"{label:<5} {bar(bf, 12)} {str(g['busy']) + '%' if g['busy'] is not None else '  -  ':>5}  "
+            f"VRAM {bar(vf, 12)} {gb(g['vram_used'])}/{gb(g['vram_total'])}  {g['pci']}"
+        )
+        if g["holders"]:
+            who = "  ".join(
+                f"{h['comm']} {gb(h['vram'])}" + (f" +gtt {gb(h['gtt'])}" if h["gtt"] > 1024**3 else "")
+                for h in g["holders"]
+            )
+            L.append("     " + who)
+    return "\n".join(L)
+
+
+# ------------------------------------------------------------------ GUI mode
+CSS = b"""
+window { background: rgba(16,18,22,0.86); border-radius: 10px; }
+label { color: #d6dbe4; font-family: monospace; font-size: 11px; }
+.head { color: #8fd3a6; font-size: 11px; font-weight: bold; }
+.dim  { color: #8b93a1; font-size: 10px; }
+.warn { color: #f0b45a; }
+.crit { color: #ff6b6b; }
+progressbar trough { min-height: 9px; border-radius: 4px; background: #2a2f38; border: none; }
+progressbar progress { min-height: 9px; border-radius: 4px; background: #4ec970; }
+progressbar.warn progress { background: #f0b45a; }
+progressbar.crit progress { background: #ff6b6b; }
+progressbar.vram trough { min-height: 5px; }
+progressbar.vram progress { min-height: 5px; background: #58a6ff; }
+button { background: #2a2f38; color: #d6dbe4; border: none; border-radius: 5px;
+         padding: 0 7px; margin: 0; min-height: 0; min-width: 0;
+         font-family: monospace; font-size: 10px; }
+button:hover { background: #3a4150; }
+button.off { color: #8b93a1; }
+.pill { background: rgba(16,18,22,0.86); border-radius: 10px; }
+.pill button { background: transparent; padding: 2px 9px; font-size: 11px; }
+"""
+
+CORNER_ALIGN = {
+    "br": ("bottom", "end"),
+    "tr": ("top", "end"),
+    "bl": ("bottom", "start"),
+    "tl": ("top", "start"),
+}
+
+
+def live_x_display():
+    """(display, xauthority) of the running desktop, found from Xwayland itself.
+
+    The desktop is GNOME on Wayland; mutter starts one Xwayland per session and
+    passes its own -auth cookie path, whose name changes at every login
+    (.mutter-Xwaylandauth.XXXXXX). Reading it from the process command line is
+    the only way that survives reboots and re-logins - and it lets this widget be
+    started from a headless shell (SSH, an agent, cron) and still draw on screen.
+    Returns (None, None) when no Xwayland is running.
+    """
+    env_disp = os.environ.get("DISPLAY")
+    env_auth = os.environ.get("XAUTHORITY")
+    if env_disp and env_auth and os.path.exists(env_auth):
+        return env_disp, env_auth
+    for status in glob.glob(f"{PROC}/[0-9]*/cmdline"):
+        try:
+            args = open(status, "rb").read().split(b"\0")
+        except OSError:
+            continue
+        args = [a.decode("utf8", "replace") for a in args if a]
+        if not args or not os.path.basename(args[0]).startswith("Xwayland"):
+            continue
+        disp, auth = None, None
+        for i, a in enumerate(args):
+            if a.startswith(":") and disp is None:
+                disp = a
+            if a == "-auth" and i + 1 < len(args):
+                auth = args[i + 1]
+        if disp and auth and os.path.exists(auth):
+            return disp, auth
+    runtime = _RUNTIME
+    cookies = sorted(glob.glob(f"{runtime}/.mutter-Xwaylandauth.*"), key=os.path.getmtime, reverse=True)
+    if env_disp and cookies:
+        return env_disp, cookies[0]
+    return None, None
+
+
+def wait_for_display(seconds=0):
+    """Poll for the desktop's Xwayland for up to N seconds (login autostart).
+
+    At session start the widget can be faster than mutter starting Xwayland, and
+    a widget that exits quietly on boot is worse than no widget at all.
+    """
+    deadline = time.time() + max(0, seconds)
+    while True:
+        disp, auth = live_x_display()
+        if disp or time.time() >= deadline:
+            return disp, auth
+        time.sleep(1)
+
+
+def attach_display(wait=0):
+    """Point GTK at the desktop's Xwayland, before any GTK import.
+
+    GDK_BACKEND=x11 is required, not cosmetic: without it GTK3 prefers the
+    Wayland socket, and a Wayland client cannot ask to be placed in a screen
+    corner or kept above other windows - which is the whole point of a widget.
+    """
+    disp, auth = wait_for_display(wait)
+    if not disp:
+        return False
+    os.environ["GDK_BACKEND"] = "x11"
+    os.environ["DISPLAY"] = disp
+    if auth:
+        os.environ["XAUTHORITY"] = auth
+    else:
+        os.environ.pop("XAUTHORITY", None)
+    return True
+
+
+def list_monitors(display):
+    """[(index, name, x, y, w, h, is_primary)] - names come from the driver."""
+    out = []
+    for i in range(display.get_n_monitors()):
+        mon = display.get_monitor(i)
+        g = mon.get_geometry()
+        try:
+            name = mon.get_model() or "?"
+        except Exception:
+            name = "?"
+        try:
+            primary = bool(mon.is_primary())
+        except Exception:
+            primary = False
+        out.append((i, name, g.x, g.y, g.width, g.height, primary))
+    return out
+
+
+def monitor_geometry(display, index=-1):
+    """(x, y, width, height) of one monitor in root coordinates.
+
+    index -1 == primary. The origin matters: this rig has a 1920x1080 panel
+    *below* the 4K one (HDMI-1 +0+853, DP-1 +1920+0), so a corner computed from
+    width/height alone would land on the wrong screen entirely.
+    """
+    try:
+        if index < 0:
+            mon = display.get_primary_monitor() or display.get_monitor(0)
+        else:
+            mon = display.get_monitor(index)
+        g = mon.get_geometry()
+        return g.x, g.y, g.width, g.height
+    except Exception:
+        return 0, 0, 1920, 1080
+
+
+def run_gui(args):
+    if not attach_display(wait=args.wait_for_display):
+        sys.exit(
+            "no Xwayland of a live desktop session found, so nothing to draw on.\n"
+            "Log in on the machine's display, or use --once / --json (works over SSH)."
+        )
+    import gi
+
+    try:
+        gi.require_version("Gdk", "3.0")
+        gi.require_version("Gtk", "3.0")
+    except ValueError:
+        sys.exit("GTK 3 bindings are missing - run: sudo apt install python3-gi gir1.2-gtk-3.0")
+    from gi.repository import Gdk, GLib, Gtk
+
+    display = Gdk.Display.get_default()
+    if display is None:
+        sys.exit(f"GTK could not open DISPLAY={os.environ.get('DISPLAY')}")
+
+    screen = display.get_default_screen()
+    provider = Gtk.CssProvider()
+    provider.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_screen(
+        screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+    )
+
+    win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+    win.set_title("rig-widget")
+    win.set_decorated(False)
+    win.set_resizable(False)
+    win.set_skip_taskbar_hint(True)
+    win.set_skip_pager_hint(True)
+    win.set_keep_above(True)
+    win.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+    win.set_app_paintable(True)
+    win.set_size_request(args.width, -1)
+    try:
+        win.set_visual(screen.get_rgba_visual())
+    except Exception:
+        pass
+    win.set_wmclass("rig-widget", "rig-widget")
+
+    grid = Gtk.Grid(row_spacing=1, column_spacing=6, margin=9)
+    win.add(grid)
+
+    top_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+    head = Gtk.Label()
+    head.get_style_context().add_class("head")
+    head.set_xalign(0)
+    head.set_ellipsize(3)  # PANGO_ELLIPSIZE_END - keeps the window at its width
+    top_bar.pack_start(head, True, True, 0)
+
+    # Buttons instead of shortcuts only: the widget is undecorated and pinned,
+    # so without on-screen controls "put it away for a while" needs a terminal.
+    btn_back = Gtk.Button(label="back")
+    btn_back.set_tooltip_text("push behind other windows (b) - the view keeps updating")
+    btn_power = Gtk.Button(label="off")
+    btn_power.set_tooltip_text("hide the panel and stop scanning (leave the small pill; click it to come back)")
+    top_bar.pack_end(btn_power, False, False, 0)
+    top_bar.pack_end(btn_back, False, False, 0)
+    grid.attach(top_bar, 0, 0, 3, 1)
+
+    class Row:
+        """Three grid lines: [name][busy bar][value], a thin VRAM bar, who-line."""
+
+        def __init__(self, name, y, warn=0.70, crit=0.90):
+            self.lbl = Gtk.Label(label=name)
+            self.lbl.set_xalign(0)
+            self.lbl.set_size_request(44, -1)
+            self.bar = Gtk.ProgressBar()
+            self.bar.set_size_request(96, -1)
+            self.val = Gtk.Label()
+            self.val.set_xalign(1)
+            self.val.set_ellipsize(3)
+            self.val.set_max_width_chars(16)
+            self.vram = Gtk.ProgressBar()
+            self.vram.get_style_context().add_class("vram")
+            self.who = Gtk.Label()
+            self.who.set_xalign(0)
+            self.who.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
+            self.who.set_max_width_chars(34)
+            self.who.get_style_context().add_class("dim")
+            self.warn, self.crit = warn, crit
+            grid.attach(self.lbl, 0, y, 1, 1)
+            grid.attach(self.bar, 1, y, 1, 1)
+            grid.attach(self.val, 2, y, 1, 1)
+            grid.attach(self.vram, 0, y + 1, 3, 1)
+            grid.attach(self.who, 0, y + 2, 3, 1)
+
+        def set(self, frac, vram_frac, value_text, vram_text, holders=()):
+            for widget, f in ((self.bar, frac), (self.vram, vram_frac)):
+                widget.set_fraction(0.0 if f is None else max(0.0, min(1.0, f)))
+                ctx = widget.get_style_context()
+                for cls in ("crit", "warn"):
+                    ctx.remove_class(cls)
+                if f is not None and f >= self.crit:
+                    ctx.add_class("crit")
+                elif f is not None and f >= self.warn:
+                    ctx.add_class("warn")
+            self.val.set_text(value_text)
+            self.val.set_tooltip_text(vram_text)
+            self.vram.set_tooltip_text(vram_text)
+            self.who.set_text(" · ".join(holders))
+
+    ram = Row("RAM", 1, warn=0.75, crit=0.90)
+
+    # --- MODELS section. A box rebuilt on every refresh, not a fixed pool of
+    # label slots: a pool left 4 empty rows (and a big dead gap) whenever no
+    # model was loaded, which read like missing clients.
+    models_title = Gtk.Label(label="LOADED MODELS")
+    models_title.get_style_context().add_class("head")
+    models_title.set_xalign(0)
+    grid.attach(models_title, 0, 4, 3, 1)
+
+    models_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+    grid.attach(models_box, 0, 5, 3, 1)
+    _MODEL_LABELS = []  # (top,bot) label pairs, created once and updated in place
+
+    harness_lbl = Gtk.Label()
+    harness_lbl.set_xalign(0)
+    harness_lbl.set_line_wrap(True)
+    harness_lbl.set_max_width_chars(42)
+    harness_lbl.get_style_context().add_class("dim")
+    harness_lbl.set_tooltip_text(
+        "Tools on this box that can drive the models.\n"
+        "A name in (brackets) has a live connection to a model right now;\n"
+        "the others are running but idle between requests."
+    )
+    grid.attach(harness_lbl, 0, 6, 3, 1)
+    GRID_GPU0 = 7
+    rows_gpu = []
+
+    def build_gpu_rows(n):
+        """Create GPU rows on demand; each row block is 3 grid lines tall."""
+        while len(rows_gpu) < n:
+            i = len(rows_gpu)
+            rows_gpu.append(Row(f"GPU{i}", GRID_GPU0 + i * 3, warn=0.70, crit=0.90))
+
+    saved = load_state()
+    state = {"show_who": saved["show_who"] and not args.no_holders,
+             "back": saved["back"], "hidden": False, "timer": None}
+
+    def refresh():
+        s = snapshot()
+        total, avail = s["ram_total"], s["ram_avail"]
+        ramf = ((total - avail) / total) if total else 0
+        swap_used = s["swap_total"] - s["swap_free"]
+        head.set_text(f"{s['host']}  {s['t']}")
+        ram.set(
+            ramf, None,
+            f"{gb(total - avail)}/{gb(total)}",
+            f"available {gb(avail)}\nswap used {gb(swap_used)} of {gb(s['swap_total'])}",
+            [f"{p['comm']} {gb(p['rss'])}" for p in s["top_ram"][:3]] if state["show_who"] else (),
+        )
+        servers = s.get("servers")
+        if servers is None:            # --no-models: section not measured at all
+            models_title.set_text("")
+            harness_lbl.set_text("")
+        else:
+            models = [sv for sv in servers if not sv["proxy"]]
+            models_title.set_text("LOADED MODELS" if models else "NO MODEL LOADED")
+            # Grow the pool when needed, then update text in place: rebuilding
+            # every label every refresh cost 3x more CPU than the actual scan.
+            while len(_MODEL_LABELS) < len(servers):
+                top = Gtk.Label()
+                top.set_xalign(0)
+                top.set_line_wrap(True)
+                top.set_max_width_chars(42)
+                bot = Gtk.Label()
+                bot.set_xalign(0)
+                bot.set_line_wrap(True)
+                bot.set_max_width_chars(42)
+                bot.get_style_context().add_class("dim")
+                models_box.pack_start(top, False, False, 0)
+                models_box.pack_start(bot, False, False, 0)
+                top.show(); bot.show()
+                _MODEL_LABELS.append((top, bot))
+            for (top, bot), sv in zip(_MODEL_LABELS, servers):
+                top.set_text(server_line(sv))
+                top.set_visible(True); bot.set_visible(True)
+                tip = (sv.get("title") or "").strip()
+                if sv.get("model_raw"):
+                    tip += ("\n" if tip else "") + sv["model_raw"]
+                if sv.get("state") and sv["state"] != "ready":
+                    tip += f"\nstate: {sv['state']}"
+                top.set_tooltip_text(tip or None)
+                bot.set_text(users_line(sv))
+            for (top, bot) in _MODEL_LABELS[len(servers):]:
+                top.set_visible(False); bot.set_visible(False)
+            h = s.get("harnesses") or []
+            if h:
+                parts = [
+                    f"{x['label']} (using now)" if x["live"] else x["label"]
+                    for x in h
+                ]
+                harness_lbl.set_text("tools: " + " · ".join(parts))
+            else:
+                harness_lbl.set_text("")
+        build_gpu_rows(len(s["gpus"]))
+        for i, (g, row) in enumerate(zip(s["gpus"], rows_gpu)):
+            bf = (g["busy"] / 100.0) if g["busy"] is not None else None
+            vf = (g["vram_used"] / g["vram_total"]) if g["vram_used"] is not None else None
+            asleep = g["busy"] is None
+            who = ()
+            if state["show_who"]:
+                who = tuple(
+                    f"{h['comm']} {gb(h['vram'])}" + (f" gtt {gb(h['gtt'])}" if h["gtt"] > 1024**3 else "")
+                    for h in g["holders"][:2]
+                )
+            row.set(
+                bf, vf,
+                "asleep" if asleep else f"{g['busy']}%  {gb(g['vram_used'])}",
+                f"{g['pci']} ({g['card']})  VRAM {gb(g['vram_used'])}/{gb(g['vram_total'])}"
+                + ("  - card asleep, sysfs busy returns EBUSY" if asleep else ""),
+                who,
+            )
+            row.lbl.set_text("iGPU" if g["name"] == "iGPU" else f"GPU{i}")
+        return True
+
+    def toggle_who():
+        state["show_who"] = not state["show_who"]
+        save_state(state)
+        refresh()
+        win.show_all()
+        for r in [ram] + rows_gpu:
+            r.who.set_visible(state["show_who"])
+
+    # --- the little pill left behind when the panel is switched off ----------
+    pill = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+    pill.set_title("rig-widget")
+    pill.set_decorated(False)
+    pill.set_resizable(False)
+    pill.set_skip_taskbar_hint(True)
+    pill.set_skip_pager_hint(True)
+    pill.set_keep_above(True)
+    pill.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+    pill.set_app_paintable(True)
+    try:
+        pill.set_visual(screen.get_rgba_visual())
+    except Exception:
+        pass
+    pill.get_style_context().add_class("pill")
+    pill_btn = Gtk.Button(label="⏻")
+    pill_btn.set_tooltip_text("rig-widget is off (idle) - click to show it again")
+    pill.add(pill_btn)
+
+    def set_front(front):
+        """keep-above is a hint mutter honors; the type hint has to change too,
+        a UTILITY window tends to stay floating even with keep-above cleared."""
+        state["back"] = not front
+        win.set_keep_above(front)
+        win.set_type_hint(Gdk.WindowTypeHint.UTILITY if front
+                          else Gtk.WindowTypeHint.NORMAL)
+        btn_back.set_label("front" if not front else "back")
+        save_state(state)
+
+    def stop_timer():
+        if state["timer"] is not None:
+            GLib.source_remove(state["timer"])
+            state["timer"] = None
+
+    def start_timer():
+        stop_timer()
+        state["timer"] = GLib.timeout_add(int(max(0.5, args.interval) * 1000), refresh)
+
+    def place_pill(*_):
+        mx, my, mw, mh = monitor_geometry(display, args.monitor)
+        pill.move(mx + mw - 46 - 14, max(36, my + mh - 34 - 12))
+        return False
+
+    def hide_panel(*_):
+        """Off = window hidden AND scanning stopped: zero CPU while it waits."""
+        state["hidden"] = True
+        win.hide()
+        stop_timer()
+        pill.show_all()
+        place_pill()
+        return False
+
+    def show_panel(*_):
+        state["hidden"] = False
+        pill.hide()
+        win.show_all()
+        for r in [ram] + rows_gpu:
+            r.who.set_visible(state["show_who"])
+        for delay in (0, 300, 900):
+            GLib.timeout_add(delay, place)
+        start_timer()
+        refresh()
+        return False
+
+    btn_power.connect("clicked", lambda *_: hide_panel())
+    pill_btn.connect("clicked", lambda *_: show_panel())
+    btn_back.connect("clicked", lambda *_: set_front(state["back"]))
+    pill.connect("destroy", lambda *a: Gtk.main_quit())
+
+    def on_key(w, e):
+        if e.keyval in (Gdk.KEY_q, Gdk.KEY_Escape):
+            Gtk.main_quit()
+        elif e.keyval == Gdk.KEY_h:
+            toggle_who()
+        elif e.keyval == Gdk.KEY_b:
+            set_front(state["back"])
+        elif e.keyval == Gdk.KEY_o:
+            hide_panel()
+        return True
+
+    win.connect("key-press-event", on_key)
+    win.connect("button-press-event", lambda *a: False if state["hidden"] else refresh() or False)
+    win.connect("destroy", lambda *a: Gtk.main_quit())
+
+    refresh()
+    build_gpu_rows(len(snapshot()["gpus"]))
+    win.show_all()
+    for r in [ram] + rows_gpu:
+        r.who.set_visible(state["show_who"])
+
+    # place in the chosen corner: override-redirect/dock windows need explicit
+    # placement, and the size is only known after the first show.
+    def place(*_):
+        """Pin the window to a corner, using its real on-screen size.
+
+        The size is only final after the first map, and GNOME's top bar owns the
+        first ~32 px, so the top corners start at y=36 and bottom corners are
+        measured from the real height. Retried a few times because the width
+        settles with the first data refresh.
+        """
+        mx, my, mw, mh = monitor_geometry(display, args.monitor)
+        try:
+            _w, h = win.get_size()
+        except Exception:
+            h = 0
+        if not h:
+            h = win.get_allocated_height() or 280
+        vert, horiz = CORNER_ALIGN[args.corner]
+        x = mx + mw - args.width - 14 if horiz == "end" else mx + 14
+        # 36 px down in the top corners: GNOME's top bar owns the first ~32 px.
+        y = my + max(36, mh - h - 12) if vert == "bottom" else my + 36
+        win.move(x, y)
+        return False
+
+    GLib.idle_add(place)
+    for delay in (300, 900, 2000, 4000):
+        GLib.timeout_add(delay, place)
+    set_front(not state["back"])   # restore where the user left it last session
+
+    # The window grows when the "who" lines appear, which pushes a bottom-corner
+    # window off the screen, so re-place whenever the height settles differently.
+    last = {"h": 0}
+
+    def on_configure(_w, event):
+        if abs(event.height - last["h"]) > 4:
+            last["h"] = event.height
+            place()
+        return False
+
+    win.connect("configure-event", on_configure)
+    start_timer()
+
+    with open(PIDFILE, "w") as fh:
+        fh.write(str(os.getpid()))
+    signal.signal(signal.SIGTERM, lambda *a: Gtk.main_quit())
+    try:
+        Gtk.main()
+    finally:
+        try:
+            os.unlink(PIDFILE)
+        except OSError:
+            pass
+
+
+def stop_running():
+    if not os.path.exists(PIDFILE):
+        print("rig-widget: not running")
+        return 0
+    pid = int(open(PIDFILE).read().strip())
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"rig-widget: stopped (pid {pid})")
+    except ProcessLookupError:
+        print("rig-widget: stale pid file, cleaned")
+        os.unlink(PIDFILE)
+    except PermissionError:
+        print(f"rig-widget: pid {pid} is not mine")
+        return 1
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="RAM + AMD GPU corner widget (read-only, no sudo)")
+    ap.add_argument("--interval", type=float, default=2.0, help="refresh seconds (default 2)")
+    ap.add_argument("--corner", choices=list(CORNER_ALIGN), default="br")
+    ap.add_argument("--monitor", type=int, default=-1,
+                    help="monitor index for --corner (-1 = primary, default)")
+    ap.add_argument("--list-monitors", action="store_true", help="print monitors and exit")
+    ap.add_argument("--wait-for-display", type=float, default=60,
+                    help="seconds to wait for the desktop session at start (default 60)")
+    ap.add_argument("--width", type=int, default=300)
+    ap.add_argument("--no-holders", action="store_true", help="bars only")
+    ap.add_argument("--no-models", action="store_true",
+                    help="skip model/harness discovery (ss, docker, llama-swap) - cheapest mode")
+    ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
+    ap.add_argument("--json", action="store_true", help="print one JSON snapshot and exit")
+    ap.add_argument("--stop", action="store_true", help="stop the running widget")
+    args = ap.parse_args()
+
+    args_no_models["on"] = args.no_models
+
+    if args.stop:
+        sys.exit(stop_running())
+
+    if args.list_monitors:
+        if not attach_display():
+            sys.exit("no live desktop display to query")
+        import gi
+
+        gi.require_version("Gdk", "3.0")
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk
+
+        Gtk.init_check()
+        disp = Gtk.get_current_event_device() if False else None
+        from gi.repository import Gdk
+
+        for i, name, x, y, w, h, primary in list_monitors(Gdk.Display.get_default()):
+            print(f"{i}  {name:<10} {w}x{h}+{x}+{y}{'  (primary)' if primary else ''}")
+        return
+
+    if args.once or args.json:
+        s = snapshot()
+        if args.json:
+            print(json.dumps(s))
+        else:
+            print(render_text(s))
+        return
+
+    if os.path.exists(PIDFILE):
+        try:
+            pid = int(open(PIDFILE).read().strip())
+            os.kill(pid, 0)
+            print(f"rig-widget: already running (pid {pid}) - use --stop first")
+            return
+        except (ProcessLookupError, ValueError):
+            pass
+
+    try:
+        run_gui(args)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

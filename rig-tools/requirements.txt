@@ -1,0 +1,5 @@
+mcp<2
+ddgs
+httpx
+trafilatura
+uvicorn

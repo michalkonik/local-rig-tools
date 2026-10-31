@@ -1,0 +1,25 @@
+# Tool server for local models (Open WebUI connects to it over MCP).
+# Edit the user, group and the two paths, then:
+#   sudo cp rig-tools/rig-tools.service.example /etc/systemd/system/rig-tools.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now rig-tools
+# The process needs: python3 + the venv from requirements.txt, a bearer token at
+# ~/.config/rig-tools/token, and (only for the optional Open WebUI note tools) membership
+# of the "docker" group.
+[Unit]
+Description=rig-tools MCP server (shell, files, web, sudo with approval page on :8766) for local models
+After=docker.service network-online.target
+Wants=docker.service network-online.target
+
+[Service]
+User=YOU
+Group=YOU
+SupplementaryGroups=docker
+WorkingDirectory=/home/YOU
+Environment=HOME=/home/YOU
+ExecStart=/home/YOU/.local/share/rig-tools/venv/bin/python /home/YOU/local-rig-tools/rig-tools/rig_tools.py --http --host 172.17.0.1 --port 8765
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "rig-web": {
+      "command": "/home/YOU/.local/share/rig-tools/venv/bin/python",
+      "args": ["/home/YOU/wherever/local-rig-tools/rig-tools/rig_tools.py", "--stdio", "--web-only"]
+    }
+  }
+}
