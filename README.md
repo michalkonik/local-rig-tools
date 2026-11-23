@@ -1,8 +1,10 @@
 # local-rig-tools
 
-Three small, self-contained tools for running **local LLMs on your own machine** and
-letting them actually *do* things: a shell, files, the web, a human-approved `sudo`,
-a desktop hardware monitor, and anonymous onion search over Tor.
+Small, self-contained tools for a machine that runs **local LLMs**. Three are ready
+to use on their own: give a model a shell, files, the web, and a human-approved
+`sudo`; watch RAM and AMD GPUs from a desktop corner; search public `.onion`
+indexes over Tor. A fourth, [`voice-bridge`](voice-bridge/), is experimental and
+described at the end.
 
 No cloud, no API keys, no telemetry. Each piece works on its own — take what you need.
 
@@ -11,6 +13,7 @@ No cloud, no API keys, no telemetry. Each piece works on its own — take what y
 | [`rig-tools/`](rig-tools/) | An **MCP server** that gives a local model a terminal, file access, web search/fetch, and `sudo` **only after you approve it in a browser page** | one Python file, ~470 lines |
 | [`rig-widget/`](rig-widget/) | A tiny always-on **corner monitor for RAM and AMD GPUs**, including per-process VRAM *without root* | one Python file, GTK3 |
 | [`tor-search/`](tor-search/) | **`.onion` search** through your local Tor proxy — DuckDuckGo's onion endpoint and Ahmia | two scripts, stdlib + curl |
+| [`voice-bridge/`](voice-bridge/) | **Experimental.** Localhost speech-to-text that speaks the Deepgram realtime protocol and transcribes with a local Whisper server | one Node script |
 
 Measured on Ubuntu 24.04 with 4x AMD Radeon AI PRO R9700 (ROCm), but nothing here
 depends on AMD except the GPU bars in `rig-widget`.
@@ -19,7 +22,7 @@ depends on AMD except the GPU bars in `rig-widget`.
 
 ## 1. rig-tools — give a local model hands (MCP server)
 
-If you run your own model (llama.cpp, vLLM, radiance, Ollama…) behind
+If you run your own model (llama.cpp, vLLM, Ollama…) behind
 [Open WebUI](https://github.com/open-webui/open-webui) or llama.cpp's built-in chat
 UI, this is the file that turns it from a chatbot into an assistant that can run a
 command, read a log, edit a config and look something up.
@@ -73,16 +76,21 @@ chmod 600 ~/.config/rig-tools/token
     --http --host 172.17.0.1 --port 8765
 ```
 
+`--host 172.17.0.1` is the Docker bridge address, so a container such as Open WebUI
+can reach the server on the host. If the client runs on the same machine and not
+inside Docker, pass `--host 127.0.0.1` instead.
+
 Two transports, because the two common UIs want different ones:
 
 | Mode | Who uses it | How |
 |---|---|---|
 | `--http` | **Open WebUI**: Settings → External Connections → add MCP server `http://<host>:8765/mcp`, bearer auth with your token | the command above |
-| `--stdio --web-only` | **llama.cpp's chat UI**: `llama-server --tools all --mcp-servers-config rig-tools/mcp-web.json` — web-only, because llama-server already ships its own shell and file tools | edit the paths in that JSON |
+| `--stdio --web-only` | **llama.cpp's chat UI**: copy `rig-tools/mcp-web.json.example`, fix the `/home/YOU` paths, then `llama-server --tools all --mcp-servers-config <that copy>` — web-only, because llama-server already ships its own shell and file tools | do not point llama-server at the example in place |
 
 `--stdio` has no browser of its own, so `request_sudo` there returns a link and
 forwards the approval to the `--http` instance (`--forward`, default
-`http://172.17.0.1:8765`).
+`http://172.17.0.1:8765`). `--web-only` also omits `list_notes` and `delete_note`:
+those are registered with the local shell tools, not with the web tools.
 
 **Run at boot:** copy [`rig-tools/rig-tools.service.example`](rig-tools/rig-tools.service.example)
 to `/etc/systemd/system/rig-tools.service`, fix the user and paths, then
@@ -181,12 +189,40 @@ A failing query says so instead of quietly returning nothing — check
 `systemctl status tor@default` first. A malformed onion address is answered by Tor
 instantly with "Invalid hostname", so copy the addresses in the scripts exactly.
 
+## 4. voice-bridge — experimental local speech-to-text
+
+A localhost WebSocket that speaks the Deepgram realtime protocol (`/listen`,
+G.711 µ-law, 8 kHz) and sends each utterance to a local Speaches Whisper server.
+It is here so OpenClaw hold-to-talk can use `ws://127.0.0.1:8790/listen` instead of
+Deepgram's cloud. The bridge itself makes no cloud calls.
+
+This one is not drop-in the way the three tools above are:
+
+* It listens only on `127.0.0.1`.
+* It expects Speaches, or another OpenAI-compatible transcription server, at
+  `SPEECHES_URL` (default `http://127.0.0.1:8001/v1`), model `whisper-1`.
+* The `Authorization` header sent to that server is the placeholder `***` in
+  `server.mjs`. Replace it if your server checks a key.
+* `package.json` has an empty description and says ISC. The repository licence
+  is MIT.
+
+```bash
+cd voice-bridge
+npm install
+node server.mjs          # ws://127.0.0.1:8790/listen
+curl -s http://127.0.0.1:8790/health
+```
+
+Environment: `PORT` (default 8790), `SPEECHES_URL`, `WHISPER_MODEL`, and
+`BRIDGE_VERBOSE=1`.
+
 ## Repository layout
 
 ```
-rig-tools/     rig_tools.py, rig-tools.service.example, mcp-web.json, requirements.txt
+rig-tools/     rig_tools.py, rig-tools.service.example, mcp-web.json.example, requirements.txt
 rig-widget/    rig-widget
 tor-search/    find_in_dark_web.py, ahmia_query.py
+voice-bridge/  server.mjs, package.json   (experimental; see above)
 LICENSE        MIT
 ```
 
